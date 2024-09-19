@@ -19,6 +19,7 @@ from processing import extract_contect, total_score, k_candidates, output_format
 dotenv_path = os.path.join(os.path.dirname(__file__), 'variables.env')
 load_dotenv(dotenv_path=dotenv_path)
 
+
 # Configurar API de OpenAI
 openai.api_key = os.getenv('MODELO_API_KEY')
 openai.api_base = os.getenv('MODELO_API_BASE')
