@@ -1,19 +1,23 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from pdfminer.high_level import extract_text
-from pdfminer.layout import LAParams
+# Reemplazamos pdfminer por PyMuPDF para mayor eficiencia
+import fitz  # PyMuPDF
 import io
 import openai
 from dotenv import load_dotenv
 import os
 import time
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
 from templates import score_cvs, inputs
 from processing import extract_contect, total_score, k_candidates, output_formatted
 
 # Cargar variables de entorno
-load_dotenv()
+dotenv_path = os.path.join(os.path.dirname(__file__), 'variables.env')
+load_dotenv(dotenv_path=dotenv_path)
 
 # Configurar API de OpenAI
 openai.api_key = os.getenv('MODELO_API_KEY')
@@ -80,39 +84,87 @@ def main():
                         job_description_html = job['attributes']['body']
                     except:
                         st.error(f"La requisición {job_id} no tiene jobs creados")
+                        return  # Salir de la función si hay un error
 
                     # Parsear la descripción del trabajo
                     soup = BeautifulSoup(job_description_html, 'html.parser')
                     job_description_text = soup.get_text(separator="\n", strip=True)
 
                     # Obtener candidatos vinculados al job
-                    cvs = []
+                    candidate_info = []
                     while has_more:
                         response_candidates = requests.get(f'{BASE_URL}/jobs/{job_id}/candidates?page[size]={page_size}&page[number]={page_number}', headers=headers)
                         data = response_candidates.json()['data']
-                    
+
                         for candidate in data:
                             resume_url = candidate['attributes']['resume']
                             candidate_id = candidate['id']
                             candidate_name = candidate['attributes']['first-name'] + ' ' + candidate['attributes']['last-name']
-                            try:
-                                resume_response = requests.get(resume_url)
-                                pdf_file = io.BytesIO(resume_response.content)
-                                laparams = LAParams()  
-                                resume_text = extract_text(pdf_file, laparams=laparams).strip()
-                                cvs.append(resume_text)
-                            except:
-                                print(f"ID: {candidate_id}, Nombre: {candidate_name} no se pudo extraer la hoja de vida")
+                            candidate_info.append({
+                                'id': candidate_id,
+                                'name': candidate_name,
+                                'resume_url': resume_url
+                            })
 
                         if len(data) < page_size:
                             has_more = False
                         else:
                             page_number += 1
-                    
-                    hojas_de_vida = len(cvs)
+
+                    hojas_de_vida = len(candidate_info)
+
+                    # Descargar hojas de vida asíncronamente
+                    async def fetch_resume(session, candidate):
+                        resume_url = candidate['resume_url']
+                        try:
+                            async with session.get(resume_url) as response:
+                                if response.status == 200:
+                                    content = await response.read()
+                                    return candidate, content
+                                else:
+                                    print(f"ID: {candidate['id']}, Nombre: {candidate['name']} no se pudo descargar la hoja de vida")
+                                    return candidate, None
+                        except Exception as e:
+                            print(f"ID: {candidate['id']}, Nombre: {candidate['name']} error al descargar: {e}")
+                            return candidate, None
+
+                    async def download_resumes(candidates):
+                        async with aiohttp.ClientSession() as session:
+                            tasks = [fetch_resume(session, candidate) for candidate in candidates]
+                            return await asyncio.gather(*tasks)
+
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    resumes = loop.run_until_complete(download_resumes(candidate_info))
+                    loop.close()
+
+                    # Filtrar los resumes descargados exitosamente
+                    valid_resumes = [(candidate, content) for candidate, content in resumes if content is not None]
+
+                    # Extraer texto de los PDFs en paralelo
+                    def extract_resume_text(args):
+                        candidate, pdf_bytes = args
+                        try:
+                            pdf_file = io.BytesIO(pdf_bytes)
+                            with fitz.open(stream=pdf_file, filetype='pdf') as doc:
+                                text = ""
+                                for page in doc:
+                                    text += page.get_text()
+                            return text.strip()
+                        except Exception as e:
+                            print(f"ID: {candidate['id']}, Nombre: {candidate['name']} no se pudo extraer la hoja de vida: {e}")
+                            return None
+
+                    with ThreadPoolExecutor() as executor:
+                        cvs = list(executor.map(extract_resume_text, valid_resumes))
+
+                    # Filtrar los textos extraídos exitosamente
+                    cvs = [cv for cv in cvs if cv is not None]
+
                     # Enviar la solicitud a OpenAI
                     all_responses = []
-                    while len(cvs) > 0:
+                    cvs_copy = cvs.copy()  # Hacemos una copia para no modificar la lista original
+                    while len(cvs_copy) > 0:
                         response = openai.ChatCompletion.create(
                             engine=os.getenv('DEPLOYMENT_NAME'),
                             messages=[
@@ -123,7 +175,7 @@ def main():
                                                                         estabilidad_laboral, 
                                                                         escolaridad,
                                                                         listado_empresas_relevantes)},
-                                {"role": "user", "content": inputs(job_description_text, cvs[:BATCH_SIZE])}
+                                {"role": "user", "content": inputs(job_description_text, cvs_copy[:BATCH_SIZE])}
                             ],
                             temperature=0.0
                         )
@@ -131,14 +183,14 @@ def main():
                         respuesta_formateada = extract_contect(modelo_respuesta)
                         puntaje_total = total_score(respuesta_formateada)
                         all_responses.extend(puntaje_total)
-                        cvs = cvs[BATCH_SIZE:] 
+                        cvs_copy = cvs_copy[BATCH_SIZE:] 
 
                     seleccionados = k_candidates(all_responses, k)
                     output_final = output_formatted(seleccionados)
                     st.success("Respuesta del modelo:")
                     end_time = time.time() 
                     execution_time = int(end_time - start_time)
-                    st.write(f"Tiempo de ejeución: {execution_time} segundos \n\n Total candidatos revisados: {hojas_de_vida}\n\n {output_final}")
+                    st.write(f"Tiempo de ejecución: {execution_time} segundos \n\n Total candidatos revisados: {hojas_de_vida}\n\n {output_final}")
                 else:
                     st.error("Error al obtener la información del trabajo.")
 
