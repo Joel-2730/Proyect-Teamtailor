@@ -1,6 +1,21 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+from pdfminer.high_level import extract_text
+from pdfminer.layout import LAParams
+import io
+import openai
+from dotenv import load_dotenv
+import os
+import time
+
+from templates import score_cvs, inputs
+from processing import extract_contect, total_score, k_candidates, output_formatted
+
+
+import streamlit as st
+import requests
+from bs4 import BeautifulSoup
 # Reemplazamos pdfminer por PyMuPDF para mayor eficiencia
 import fitz  # PyMuPDF
 import io
@@ -15,10 +30,14 @@ from concurrent.futures import ThreadPoolExecutor
 from templates import score_cvs, inputs
 from processing import extract_contect, total_score, k_candidates, output_formatted
 
+import plotly.graph_objects as go
+import plotly.express as px
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from math import pi
 # Cargar variables de entorno
-dotenv_path = os.path.join(os.path.dirname(__file__), 'variables.env')
-load_dotenv(dotenv_path=dotenv_path)
-
+load_dotenv(dotenv_path='variables.env')
 
 # Configurar API de OpenAI
 openai.api_key = os.getenv('MODELO_API_KEY')
@@ -40,6 +59,110 @@ headers = {
 
 with open('empresas_relevantes.txt', 'r') as file:
     listado_empresas_relevantes = file.read()
+
+
+
+seleccionadoss = [
+    {
+        'name': 'Candidato 1',
+        'experiencia_liderando': 80,
+        'experiencia_laboral': 70,
+        'habilidades': 60,
+        'idiomas': 50,
+        'empresas_relevantes': 90,
+        'estabilidad_laboral': 40,
+        'escolaridad': 85
+    },
+    {
+        'name': 'Candidato 2',
+        'experiencia_liderando': 60,
+        'experiencia_laboral': 80,
+        'habilidades': 75,
+        'idiomas': 65,
+        'empresas_relevantes': 55,
+        'estabilidad_laboral': 70,
+        'escolaridad': 60
+    },
+    {
+        'name': 'Candidato 3',
+        'experiencia_liderando': 50,
+        'experiencia_laboral': 40,
+        'habilidades': 80,
+        'idiomas': 70,
+        'empresas_relevantes': 85,
+        'estabilidad_laboral': 60,
+        'escolaridad': 75
+    }
+]
+
+# 1. Gráfico de Radar (Spider Chart) - Comparación entre Candidatos
+def radar_chart(candidatos):
+    # Definir los aspectos evaluados
+    aspectos = ['Experiencia Liderando', 'Experiencia Laboral', 'Habilidades', 'Idiomas', 'Empresas Relevantes', 'Estabilidad Laboral', 'Escolaridad']
+    num_aspectos = len(aspectos)
+
+    # Crear la figura y los ejes para el gráfico de radar
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+
+    # Crear el ángulo para cada aspecto
+    angles = [n / float(num_aspectos) * 2 * pi for n in range(num_aspectos)]
+    angles += angles[:1]  # Cerrar el gráfico
+
+    # Graficar cada candidato
+    for candidato in seleccionadoss:
+        puntajes_aspectos = [
+            candidato['experiencia_liderando'],
+            candidato['experiencia_laboral'],
+            candidato['habilidades'],
+            candidato['idiomas'],
+            candidato['empresas_relevantes'],
+            candidato['estabilidad_laboral'],
+            candidato['escolaridad']
+        ]
+        puntajes_aspectos += puntajes_aspectos[:1]  # Cerrar el gráfico
+
+        ax.plot(angles, puntajes_aspectos, linewidth=2, linestyle='solid', label=candidato["name"])
+        ax.fill(angles, puntajes_aspectos, alpha=0.25)
+
+    # Añadir las etiquetas de los aspectos
+    plt.xticks(angles[:-1], aspectos)
+
+    # Título y leyenda
+    ax.set_title("Comparación de Candidatos (Gráfico de Radar)", size=15)
+    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+
+    # Mostrar el gráfico en Streamlit
+    st.pyplot(fig)
+    plt.clf()
+
+
+def horizontal_bar_chart(candidatos):
+    aspectos = ['Experiencia Liderando', 'Experiencia Laboral', 'Habilidades', 'Idiomas', 'Empresas Relevantes', 'Estabilidad Laboral', 'Escolaridad']
+    
+    for candidato in seleccionadoss:
+        puntajes_aspectos = [
+            candidato['experiencia_liderando'],
+            candidato['experiencia_laboral'],
+            candidato['habilidades'],
+            candidato['idiomas'],
+            candidato['empresas_relevantes'],
+            candidato['estabilidad_laboral'],
+            candidato['escolaridad']
+        ]
+
+        # Crear gráfico de barras horizontales
+        fig, ax = plt.subplots(figsize=(8, 5))
+        y_pos = np.arange(len(aspectos))
+        ax.barh(y_pos, puntajes_aspectos, align='center', color='skyblue')
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(aspectos)
+        ax.invert_yaxis()  # Invertir el eje y para que el primer aspecto esté arriba
+        ax.set_xlabel('Puntaje')
+        ax.set_title(f'Adecuación de {candidato["name"]} a la Job Description')
+
+        # Mostrar el gráfico en Streamlit
+        st.pyplot(fig)
+        plt.clf()
 
 # Definir la función principal
 def main():
@@ -85,87 +208,39 @@ def main():
                         job_description_html = job['attributes']['body']
                     except:
                         st.error(f"La requisición {job_id} no tiene jobs creados")
-                        return  # Salir de la función si hay un error
 
                     # Parsear la descripción del trabajo
                     soup = BeautifulSoup(job_description_html, 'html.parser')
                     job_description_text = soup.get_text(separator="\n", strip=True)
 
                     # Obtener candidatos vinculados al job
-                    candidate_info = []
+                    cvs = []
                     while has_more:
                         response_candidates = requests.get(f'{BASE_URL}/jobs/{job_id}/candidates?page[size]={page_size}&page[number]={page_number}', headers=headers)
                         data = response_candidates.json()['data']
-
+                    
                         for candidate in data:
                             resume_url = candidate['attributes']['resume']
                             candidate_id = candidate['id']
                             candidate_name = candidate['attributes']['first-name'] + ' ' + candidate['attributes']['last-name']
-                            candidate_info.append({
-                                'id': candidate_id,
-                                'name': candidate_name,
-                                'resume_url': resume_url
-                            })
+                            try:
+                                resume_response = requests.get(resume_url)
+                                pdf_file = io.BytesIO(resume_response.content)
+                                laparams = LAParams()  
+                                resume_text = extract_text(pdf_file, laparams=laparams).strip()
+                                cvs.append(resume_text)
+                            except:
+                                print(f"ID: {candidate_id}, Nombre: {candidate_name} no se pudo extraer la hoja de vida")
 
                         if len(data) < page_size:
                             has_more = False
                         else:
                             page_number += 1
-
-                    hojas_de_vida = len(candidate_info)
-
-                    # Descargar hojas de vida asíncronamente
-                    async def fetch_resume(session, candidate):
-                        resume_url = candidate['resume_url']
-                        try:
-                            async with session.get(resume_url) as response:
-                                if response.status == 200:
-                                    content = await response.read()
-                                    return candidate, content
-                                else:
-                                    print(f"ID: {candidate['id']}, Nombre: {candidate['name']} no se pudo descargar la hoja de vida")
-                                    return candidate, None
-                        except Exception as e:
-                            print(f"ID: {candidate['id']}, Nombre: {candidate['name']} error al descargar: {e}")
-                            return candidate, None
-
-                    async def download_resumes(candidates):
-                        async with aiohttp.ClientSession() as session:
-                            tasks = [fetch_resume(session, candidate) for candidate in candidates]
-                            return await asyncio.gather(*tasks)
-
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    resumes = loop.run_until_complete(download_resumes(candidate_info))
-                    loop.close()
-
-                    # Filtrar los resumes descargados exitosamente
-                    valid_resumes = [(candidate, content) for candidate, content in resumes if content is not None]
-
-                    # Extraer texto de los PDFs en paralelo
-                    def extract_resume_text(args):
-                        candidate, pdf_bytes = args
-                        try:
-                            pdf_file = io.BytesIO(pdf_bytes)
-                            with fitz.open(stream=pdf_file, filetype='pdf') as doc:
-                                text = ""
-                                for page in doc:
-                                    text += page.get_text()
-                            return text.strip()
-                        except Exception as e:
-                            print(f"ID: {candidate['id']}, Nombre: {candidate['name']} no se pudo extraer la hoja de vida: {e}")
-                            return None
-
-                    with ThreadPoolExecutor() as executor:
-                        cvs = list(executor.map(extract_resume_text, valid_resumes))
-
-                    # Filtrar los textos extraídos exitosamente
-                    cvs = [cv for cv in cvs if cv is not None]
-
+                    
+                    hojas_de_vida = len(cvs)
                     # Enviar la solicitud a OpenAI
                     all_responses = []
-                    cvs_copy = cvs.copy()  # Hacemos una copia para no modificar la lista original
-                    while len(cvs_copy) > 0:
+                    while len(cvs) > 0:
                         response = openai.ChatCompletion.create(
                             engine=os.getenv('DEPLOYMENT_NAME'),
                             messages=[
@@ -176,7 +251,7 @@ def main():
                                                                         estabilidad_laboral, 
                                                                         escolaridad,
                                                                         listado_empresas_relevantes)},
-                                {"role": "user", "content": inputs(job_description_text, cvs_copy[:BATCH_SIZE])}
+                                {"role": "user", "content": inputs(job_description_text, cvs[:BATCH_SIZE])}
                             ],
                             temperature=0.0
                         )
@@ -184,17 +259,18 @@ def main():
                         respuesta_formateada = extract_contect(modelo_respuesta)
                         puntaje_total = total_score(respuesta_formateada)
                         all_responses.extend(puntaje_total)
-                        cvs_copy = cvs_copy[BATCH_SIZE:] 
+                        cvs = cvs[BATCH_SIZE:] 
 
                     seleccionados = k_candidates(all_responses, k)
                     output_final = output_formatted(seleccionados)
                     st.success("Respuesta del modelo:")
                     end_time = time.time() 
                     execution_time = int(end_time - start_time)
-                    st.write(f"Tiempo de ejecución: {execution_time} segundos \n\n Total candidatos revisados: {hojas_de_vida}\n\n {output_final}")
+                    st.write(f"Tiempo de ejeución: {execution_time} segundos \n\n Total candidatos revisados: {hojas_de_vida}\n\n {output_final}")
+                    radar_chart(seleccionados)
+                    horizontal_bar_chart(seleccionados)
                 else:
                     st.error("Error al obtener la información del trabajo.")
 
 if __name__ == "__main__":
     main()
-
